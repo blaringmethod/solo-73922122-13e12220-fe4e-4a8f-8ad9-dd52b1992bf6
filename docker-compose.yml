@@ -27,8 +27,12 @@ services:
       MAX_SESSIONS: "2"
       SESSION_TTL_SECONDS: "60"
       PAGE_SIZE_CAP: "100"
-      # 开启后可用 X-Debug-Sleep-Seconds 头制造慢取页，供演示使用
+      # 开启后可用 X-Debug-Sleep-Seconds 头制造慢取页，
+      # 并注册 /debug/* 故障注入接口（归还失败/恢复演示），供演示使用
       ENABLE_DEBUG_HOOKS: "true"
+      SWEEPER_INTERVAL_SECONDS: "0.25"
+      POOL_MIN_SIZE: "1"
+      POOL_MAX_SIZE: "10"
     ports:
       - "8000:8000"
 

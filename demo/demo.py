@@ -13,7 +13,11 @@
    关闭一个后名额归还，可再开；另一个会话不受影响。
 4. 慢取页 + 及时关闭：用 X-Debug-Sleep-Seconds 头让取页变慢，
    在它响应前发起关闭，关闭返回后再取页 -> 409 且无明细。
-5. 到期失效（可选，较慢）：设置 DEMO_TTL_WAIT=1 时，
+5. 收尾失败与恢复：注入连接池归还故障，关闭停留 closing（不可取页、
+   状态可查、名额不释放、不谎报终态）；重复关闭持续重试；解除故障后
+   重复关闭/sweeper 完成归还，才报 closed 并开放名额；并发重复收尾
+   同一条连接只归还一次。
+6. 到期收尾失败（可选，较慢）：设置 DEMO_TTL_WAIT=1 时，
    等待会话到期后取页 -> 410 且无明细。
 """
 from __future__ import annotations
@@ -68,6 +72,7 @@ def main() -> int:
     print(f"服务参数: {meta}")
 
     # 清理可能存在的旧会话，保证演示可重复运行
+    call("POST", "/debug/return-fault?enabled=false")
     for s in call("GET", "/sessions")[1]:
         if s["status"] in ("open", "closing"):
             call("POST", f"/sessions/{s['session_id']}/close")
@@ -180,8 +185,97 @@ def main() -> int:
     call("POST", f"/sessions/{s5['session_id']}/close")
 
     # ------------------------------------------------------------------
+    title(5, "收尾失败与恢复：归还失败停留 closing，恢复后重试才落终态、开放名额")
+    # 场景 1 的会话此前一直开着用于快照隔离演示，先正常收尾腾出名额
+    call("POST", f"/sessions/{sid1}/close")
+    st, fault = call("POST", "/debug/return-fault?enabled=true")
+    check(st == 200 and fault["return_fault_enabled"] is True,
+          "已注入连接池归还故障（/debug/return-fault?enabled=true）")
+
+    _, sf = call("POST", "/sessions", {"region": "华南"})
+    sidf = sf["session_id"]
+    st, cf = call("POST", f"/sessions/{sidf}/close")
+    check(st == 200 and cf["status"] == "closing",
+          f"故障下关闭不谎报 closed：状态={cf['status']}，名额暂不释放")
+    check(cf["conn_returned"] is False and cf["teardown_attempts"] >= 1,
+          f"连接未归还（conn_returned=false），收尾尝试 {cf['teardown_attempts']} 次，"
+          f"错误：{cf['last_teardown_error']}")
+
+    st, pf = call("GET", f"/sessions/{sidf}/claims?page=1")
+    check(st == 409 and "rows" not in pf, "closing 旧会话不可取页（409，无明细）")
+    st, qf = call("GET", f"/sessions/{sidf}")
+    check(st == 200 and qf["status"] == "closing", "会话状态仍可查询，保持 closing")
+
+    # 名额仍被占：满额下新会话 429
+    _, so = call("POST", "/sessions", {"region": "华东"})
+    st, blocked = call("POST", "/sessions", {"region": "华北"})
+    check(st == 429 and blocked["code"] == "capacity_reached",
+          "归还未完成前名额不释放：新会话开启被 429 拒绝")
+
+    # 故障期间重复关闭：继续重试，仍失败，状态保持 closing
+    st, retry = call("POST", f"/sessions/{sidf}/close")
+    check(st == 200 and retry["status"] == "closing" and retry["conn_returned"] is False,
+          f"故障期重复关闭继续重试（累计 {retry['teardown_attempts']} 次），仍停留 closing")
+
+    # 另一会话在自己的连接上继续分页，不受故障收尾影响
+    st, po = call("GET", f"/sessions/{so['session_id']}/claims?page=1&page_size=5")
+    check(st == 200 and len(po["rows"]) == 5, "另一会话持有独立连接，分页照常不受影响")
+
+    # 并发重复收尾：6 个关闭请求同时打进来
+    box2 = []
+
+    def concurrent_close():
+        box2.append(call("POST", f"/sessions/{sidf}/close")[1])
+
+    call("POST", "/debug/return-fault?enabled=false")
+    threads = [threading.Thread(target=concurrent_close) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    check(len(box2) == 6 and all(b["status"] == "closed" for b in box2),
+          "连接池恢复后并发重复收尾全部得到终态 closed")
+    st, final = call("GET", f"/sessions/{sidf}")
+    check(st == 200 and final["status"] == "closed" and final["conn_returned"] is True,
+          f"连接确实归还后才报 closed（共尝试 {final['teardown_attempts']} 次，"
+          "同一条连接仅成功归还一次）")
+    check(final["last_teardown_error"] is None, "归还成功后 last_teardown_error 已清空")
+
+    # 名额开放：此前被拒的会话现在可开，且新会话分页正常
+    st, sn = call("POST", "/sessions", {"region": "华北"})
+    check(st == 201 and sn["status"] == "open", "收尾完成后名额开放，新会话开启成功")
+    st, pn = call("GET", f"/sessions/{sn['session_id']}/claims?page=1&page_size=5")
+    check(st == 200 and len(pn["rows"]) == 5, "新会话借到连接并正常取页（未卡在借连接）")
+    call("POST", f"/sessions/{so['session_id']}/close")
+    call("POST", f"/sessions/{sn['session_id']}/close")
+    call("POST", "/debug/return-fault?enabled=false")
+
+    # 到期 + 归还失败的恢复路径（快速版，无需等 60 秒；同样走 sweeper 收尾）
+    _, se = call("POST", "/sessions", {"region": "华南"})
+    side = se["session_id"]
+    call("POST", "/debug/return-fault?enabled=true")
+    call("POST", f"/sessions/{side}/debug/expire-now")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if call("GET", f"/sessions/{side}")[1]["status"] == "closing":
+            break
+        time.sleep(0.1)
+    st, qe = call("GET", f"/sessions/{side}")
+    check(st == 200 and qe["status"] == "closing" and qe["close_reason"] == "expired",
+          "到期时若归还失败：停留 closing 且原因记录为 expired")
+    call("POST", "/debug/return-fault?enabled=false")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if call("GET", f"/sessions/{side}")[1]["status"] == "expired":
+            break
+        time.sleep(0.1)
+    st, fe = call("GET", f"/sessions/{side}")
+    check(st == 200 and fe["status"] == "expired" and fe["conn_returned"] is True,
+          "恢复后 sweeper 自动收尾，终态为 expired（不被重复关闭改写成 closed）")
+
+    # ------------------------------------------------------------------
     if TTL_WAIT:
-        title(5, "到期失效：60 秒后会话自动到期，取页 410 且无明细")
+        title(6, "到期失效：60 秒后会话自然到期，取页 410 且无明细")
         _, s6 = call("POST", "/sessions", {"region": "华南"})
         sid6 = s6["session_id"]
         print("    等待 62 秒让会话到期 …")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -40,7 +41,9 @@ app = FastAPI(
         "- 会话内两表（policies/claims）固定为开启时刻的同一快照\n"
         "- 源端增改删照常提交，不影响会话内读取\n"
         f"- 最多 {settings.max_sessions} 个并发会话，会话 {settings.session_ttl_seconds} 秒到期\n"
-        "- 关闭受理后未开始响应的取页一律失败，不返回明细"
+        "- 关闭受理后未开始响应的取页一律失败，不返回明细\n"
+        "- 连接归还失败时会话停留 closing：不可取页、状态可查、名额暂不释放；\n"
+        "  连接池恢复后重复关闭或 sweeper 重试完成归还，才进入终态并开放名额"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -68,6 +71,10 @@ def _session_info(s) -> SessionInfo:
         last_page_at=s.last_page_at,
         pages_served=s.pages_served,
         ttl_seconds=settings.session_ttl_seconds,
+        close_reason=s.close_reason,
+        conn_returned=s.conn_returned,
+        teardown_attempts=s.teardown_attempts,
+        last_teardown_error=s.last_teardown_error,
     )
 
 
@@ -87,6 +94,50 @@ def meta():
         "page_size_cap": settings.page_size_cap,
         "debug_hooks_enabled": settings.enable_debug_hooks,
     }
+
+
+# ----------------------------------------------------------------------
+# 调试/演示钩子：仅 ENABLE_DEBUG_HOOKS=true 时才注册路由，
+# 关闭时接口与 /docs 文档中都不存在这些路径。
+# ----------------------------------------------------------------------
+async def set_return_fault(enabled: bool = Query(..., description="true=归还一律失败；false=恢复正常")):
+    state = await asyncio.to_thread(manager.set_return_fault, enabled)
+    return state
+
+
+async def debug_state():
+    return await asyncio.to_thread(manager.debug_state)
+
+
+async def force_expire(session_id: str):
+    def _expire():
+        session = manager.get_status(session_id)
+        # 直接把到期时间移到过去：下一轮 sweeper 即以 expired 原因收尾，
+        # 与自然 60 秒到期走完全相同的代码路径。
+        with session.state_lock:
+            session.expires_at = datetime.now(timezone.utc)
+        return session
+
+    session = await asyncio.to_thread(_expire)
+    return _session_info(session)
+
+
+if settings.enable_debug_hooks:
+    app.add_api_route(
+        "/debug/return-fault", set_return_fault, methods=["POST"],
+        tags=["debug"],
+        summary="拨动连接池归还故障注入（演示收尾失败与恢复）",
+    )
+    app.add_api_route(
+        "/debug/state", debug_state, methods=["GET"], tags=["debug"],
+        summary="查看故障开关与连接池统计",
+    )
+    app.add_api_route(
+        "/sessions/{session_id}/debug/expire-now", force_expire,
+        methods=["POST"], tags=["debug"], response_model=SessionInfo,
+        summary="立即使会话到期（演示到期收尾，无需等待完整 TTL）",
+        responses={404: {"model": Message, "description": "会话不存在"}},
+    )
 
 
 # ----------------------------------------------------------------------
@@ -132,7 +183,10 @@ async def session_status(session_id: str):
     "/sessions/{session_id}/close",
     response_model=SessionInfo,
     tags=["sessions"],
-    summary="主动关闭会话（受理后未开始的取页立即失败）",
+    summary=(
+        "主动关闭会话（受理后未开始的取页立即失败；若连接归还失败则停留 "
+        "closing，可重复调用本接口在恢复后完成收尾）"
+    ),
     responses={404: {"model": Message}},
 )
 async def close_session(session_id: str):

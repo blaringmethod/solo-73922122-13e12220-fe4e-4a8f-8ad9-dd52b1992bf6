@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, PositiveInt
 
 class SessionStatus(str, Enum):
     OPEN = "open"          # 可正常取页
-    CLOSING = "closing"    # 关闭已受理，正在等待在途取页结束
+    CLOSING = "closing"    # 关闭已受理：新取页一律失败；若连接归还失败会停留在此状态
     CLOSED = "closed"      # 事务已回滚、连接已归还、名额已释放
     EXPIRED = "expired"    # 到期后由清理线程转入的终态（语义同 closed）
 
@@ -27,6 +27,21 @@ class SessionInfo(BaseModel):
     last_page_at: datetime | None = None
     pages_served: int
     ttl_seconds: int
+    # 以下字段描述收尾链路：closing 期间可观察归还重试过程，
+    # 到达 closed/expired 后 last_teardown_error 清空。
+    close_reason: str | None = Field(
+        default=None,
+        description="关闭受理原因：closed/expired/connection_lost/shutdown",
+    )
+    conn_returned: bool = Field(
+        default=False, description="快照连接是否已成功归还连接池"
+    )
+    teardown_attempts: int = Field(
+        default=0, description="收尾尝试次数（含归还失败后的重试）"
+    )
+    last_teardown_error: str | None = Field(
+        default=None, description="最近一次收尾失败原因；归还成功后清空"
+    )
 
 
 class ClaimRow(BaseModel):
